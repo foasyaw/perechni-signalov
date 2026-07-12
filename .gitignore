@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.exe
+build/
+dist/
+*.spec
+config.json
+.venv/
+venv/
+*.bak
+~$*

@@ -225,6 +225,7 @@ NAV = [("home", "◈", "Дашборд"),
        ("signals", "≣", "Сигналы"),
        ("spec", "▤", "Спецификация"),
        ("conv", "⇄", "Конвертер DWG"),
+       ("pdf", "⎙", "PDF по листам"),
        ("diff", "Δ", "Сравнение версий"),
        ("sep2", None, None),
        ("settings", "⚙", "Настройки"),
@@ -256,6 +257,9 @@ class App(BaseTk):
         self.var_pdf = tk.BooleanVar(value=cfg.get("make_pdf", False))
         self.var_rev = tk.BooleanVar(value=cfg.get("revisions", True))
         self.var_cdst = tk.StringVar(value=cfg.get("conv_dir", ""))
+        self.var_pdfdst = tk.StringVar(value=cfg.get("pdf_dir", ""))
+        self.var_pdfcolor = tk.BooleanVar(value=cfg.get("pdf_color", False))
+        self.var_pdfone = tk.BooleanVar(value=cfg.get("pdf_one", False))
         self.var_addlist = tk.BooleanVar(value=cfg.get("conv_add", True))
         self.var_conv = tk.StringVar(value=cfg.get("converter", ""))
         self.var_old_in = tk.StringVar(value=cfg.get("old_in", ""))
@@ -387,6 +391,7 @@ class App(BaseTk):
             "signals": self._page_signals(self.page_area),
             "spec": self._page_spec(self.page_area),
             "conv": self._page_conv(self.page_area),
+            "pdf": self._page_pdf(self.page_area),
             "diff": self._page_diff(self.page_area),
             "settings": self._page_settings(self.page_area),
             "about": self._page_about(self.page_area),
@@ -404,12 +409,19 @@ class App(BaseTk):
                  if os.path.splitext(f)[1].lower() in exts]))
         bind_drop(self.fl.tree, (".dxf", ".dwg"), self._drop_build)
         bind_drop(self.cl.tree, (".dwg",), self._drop_conv)
+        bind_drop(self.pl.tree, (".dxf", ".dwg"), self._drop_pdf)
 
     def _drop_build(self, files):
         for f in files:
             self.fl.add(f, core.cab_name_from_file(f))
         if files:
             self.sections = None
+
+    def _drop_pdf(self, files):
+        for f in files:
+            self.pl.add(f, "—")
+        if files:
+            self.log(f"Добавлено на печать: {len(files)}")
 
     def _drop_conv(self, files):
         for f in files:
@@ -900,6 +912,155 @@ class App(BaseTk):
         self.engine_lbl.pack(side="left", padx=12)
         return fr
 
+    # -------------------------------------------------------- стр. PDF по листам
+    def _page_pdf(self, parent):
+        fr = tk.Frame(parent, bg=BG)
+        self._header(fr, "PDF по листам",
+                     "каждый лист чертежа — отдельная страница своего формата (А5…А0, А4х3 и др.)")
+        c1 = Card(fr, "Чертежи", "DWG сконвертируются автоматически")
+        c1.pack(fill="both", expand=True, padx=16, pady=5)
+        self.pl = FileList(c1.body, [("file", "Чертёж", 470), ("fmt", "Форматы листов", 200)])
+        self.pl.add_cb = self.add_pdf_files
+        self.pl.pack(fill="both", expand=True)
+        bar = tk.Frame(c1.body, bg=CARD)
+        bar.pack(fill="x", pady=(6, 0))
+        flat_btn(bar, "⟳ Определить форматы", self.scan_formats).pack(side="left")
+        flat_btn(bar, "↧ Взять из «Сборки»", self.pdf_from_build).pack(side="left", padx=(8, 0))
+        self.pdf_hint = tk.Label(bar, text="", font=FONT_SM, bg=CARD, fg=MUTED)
+        self.pdf_hint.pack(side="left", padx=12)
+
+        c2 = Card(fr, "Параметры")
+        c2.pack(fill="x", padx=16, pady=5)
+        PathRow(c2.body, "Папка для PDF:", self.var_pdfdst,
+                lambda: self._pickdir(self.var_pdfdst)).pack(fill="x", pady=2)
+        tk.Label(c2.body, text="(пусто — PDF сохранится рядом с чертежом)", font=FONT_SM,
+                 bg=CARD, fg=MUTED).pack(anchor="w", padx=(150, 0))
+        tk.Checkbutton(c2.body, text="Цветная печать (по умолчанию — чёрно-белая)",
+                       variable=self.var_pdfcolor, font=FONT_SM, bg=CARD, fg=TEXT,
+                       activebackground=CARD, selectcolor=FIELD,
+                       activeforeground=TEXT).pack(anchor="w", pady=(3, 0))
+        tk.Checkbutton(c2.body, text="Все чертежи в один PDF-файл",
+                       variable=self.var_pdfone, font=FONT_SM, bg=CARD, fg=TEXT,
+                       activebackground=CARD, selectcolor=FIELD,
+                       activeforeground=TEXT).pack(anchor="w")
+
+        run = tk.Frame(fr, bg=BG)
+        run.pack(fill="x", padx=16, pady=(4, 6))
+        self.pbtn = flat_btn(run, "Печать в PDF", self.make_pdf, primary=True)
+        self.pbtn.pack(side="left")
+        self.pprog = ttk.Progressbar(run, mode="determinate",
+                                     style="Blue.Horizontal.TProgressbar", length=220)
+        self.pstat = tk.Label(run, text="", font=FONT_SM, bg=BG, fg=MUTED)
+        self.pstat.pack(side="left", padx=12)
+        self.pdf_results = []
+        return fr
+
+    def add_pdf_files(self):
+        ps = filedialog.askopenfilenames(
+            filetypes=[("Чертежи", "*.dxf *.dwg"), ("DXF", "*.dxf"), ("DWG", "*.dwg")])
+        for x in ps:
+            self.pl.add(x, "—")
+
+    def pdf_from_build(self):
+        n = 0
+        have = {p for p, _v in self.pl.items()}
+        for path, _vals in self.fl.items():
+            if path not in have and path.lower().endswith((".dwg", ".dxf")):
+                self.pl.add(path, "—")
+                n += 1
+        self.log(f"Добавлено из «Сборки»: {n}" if n else "Нечего добавлять из «Сборки»")
+
+    def scan_formats(self):
+        items = self.pl.items()
+        if not items:
+            messagebox.showwarning("Нет файлов", "Добавьте чертежи.")
+            return
+        self.pdf_hint.configure(text="определяю…")
+        threading.Thread(target=self._scan_work, args=(items,), daemon=True).start()
+
+    def _scan_work(self, items):
+        total = 0
+        for iid, (path, _vals) in zip(self.pl.tree.get_children(), items):
+            try:
+                if path.lower().endswith(".dwg"):
+                    conv = core.dwg_to_dxf([path], exe=self._conv_exe() or None,
+                                           log=lambda s: None)
+                    path = conv.get(path, path)
+                _doc, frames = core.detect_sheets(path)
+                txt = core.sheets_summary(frames) if frames else "рамки не найдены"
+                total += len(frames)
+            except Exception as e:
+                txt = "ошибка: " + str(e)[:40]
+            self.after(0, lambda i=iid, t=txt: self.pl.tree.set(i, "fmt", t))
+        self.after(0, lambda: self.pdf_hint.configure(text=f"всего листов: {total}"))
+        self.after(0, self.log, f"Форматы определены, листов всего: {total}", OK)
+
+    def make_pdf(self):
+        items = self.pl.items()
+        if not items:
+            messagebox.showwarning("Нет файлов", "Добавьте чертежи.")
+            return
+        self._save_cfg()
+        self.pbtn.configure(state="disabled", bg=ACCENT_DIS)
+        self.pprog.pack(side="left", padx=12)
+        self.pprog.configure(value=0, maximum=100)
+        self.pstat.configure(text="печать…", fg=MUTED)
+        threading.Thread(target=self._pdf_work, args=([p for p, _v in items],),
+                         daemon=True).start()
+
+    def _pdf_work(self, paths):
+        try:
+            out_dir = self.var_pdfdst.get().strip()
+            color = self.var_pdfcolor.get()
+            one = self.var_pdfone.get()
+            log = self._logcb()
+            exe = self._conv_exe() or None
+            dwgs = [x for x in paths if x.lower().endswith(".dwg")]
+            conv = core.dwg_to_dxf(dwgs, exe=exe, log=log) if dwgs else {}
+            results, pages_all = [], []
+            for i, src in enumerate(paths, 1):
+                dxf = conv.get(src, src)
+                self.after(0, self.log, f"Печать: {os.path.basename(src)}")
+                od = out_dir or os.path.dirname(src)
+                os.makedirs(od, exist_ok=True)
+                if one:
+                    pages_all.append(dxf)
+                    continue
+
+                def prog(k, n, i=i, tot=len(paths)):
+                    pct = ((i - 1) + k / max(n, 1)) / tot * 100
+                    self.after(0, lambda: self.pprog.configure(value=pct))
+                    self.after(0, lambda: self.pstat.configure(
+                        text=f"{os.path.basename(src)[:24]}: лист {k}/{n}"))
+                out = os.path.join(od, os.path.splitext(os.path.basename(src))[0] + ".pdf")
+                r, _fr = core.export_sheets_pdf(dxf, out, color=color, log=log, progress=prog)
+                if r:
+                    results.append(r)
+            if one and pages_all:
+                od = out_dir or os.path.dirname(paths[0])
+                out = os.path.join(od, "Чертежи (полистно).pdf")
+
+                def prog1(k, n):
+                    self.after(0, lambda: self.pprog.configure(value=k / max(n, 1) * 100))
+                    self.after(0, lambda: self.pstat.configure(text=f"лист {k}/{n}"))
+                r = core.export_sheets_pdf_multi(pages_all, out, color=color,
+                                                 log=log, progress=prog1)
+                if r:
+                    results.append(r)
+            self.pdf_results = results
+            self.after(0, self.log, "ГОТОВО: " + "; ".join(os.path.basename(r) for r in results), OK)
+            self.after(0, lambda: self.pstat.configure(text="готово ✓", fg=OK))
+            if results:
+                self.after(0, lambda: messagebox.showinfo(
+                    "Готово", "Создано PDF: %d\n\n%s" % (len(results), "\n".join(results))))
+        except Exception as e:
+            self.after(0, self.log, "ОШИБКА: " + str(e), ERR)
+            self.after(0, lambda: self.pstat.configure(text="ошибка", fg=ERR))
+            self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+        finally:
+            self.after(0, self.pprog.pack_forget)
+            self.after(0, lambda: self.pbtn.configure(state="normal", bg=ACCENT))
+
     # ---------------------------------------------------------- стр. Сравнение
     def _page_diff(self, parent):
         fr = tk.Frame(parent, bg=BG)
@@ -1094,6 +1255,8 @@ class App(BaseTk):
                       template_in=self.var_in.get(), template_out=self.var_out.get(),
                       out_dir=self.var_dst.get(), update_fields=self.var_upd.get(), make_pdf=self.var_pdf.get(), revisions=self.var_rev.get(),
                       conv_dir=self.var_cdst.get(), conv_add=self.var_addlist.get(),
+                      pdf_dir=self.var_pdfdst.get(), pdf_color=self.var_pdfcolor.get(),
+                      pdf_one=self.var_pdfone.get(),
                       converter=self.var_conv.get(),
                       old_in=self.var_old_in.get(), old_out=self.var_old_out.get(),
                       s_donor=self.var_s_donor.get(),

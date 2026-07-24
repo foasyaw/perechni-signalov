@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Ядро: извлечение сигналов из чертежей схем подключения (DWG/DXF)
+Ядро: извлечение сигналов из чертежей схем подключения (ШСК, DWG/DXF)
 и заполнение Word-перечней входных/выходных сигналов по шаблону.
 
-Логика проверена на реальном проекте.
+Логика проверена на проекте 0990-АК (ШСК2/ШСК3/ШСК4).
 Ожидаемый стиль чертежа:
   - заголовки аналоговых модулей: TEXT "Модуль X.Y AI|AO|WI ..." ;
   - описания каналов: MTEXT на слое "Текст" с "поз. <ТЕГ>." ;
@@ -20,6 +20,17 @@ import ezdxf
 from docx import Document
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+
+
+def read_dxf(path):
+    """Читает DXF; если файл битый — восстанавливает через ezdxf.recover."""
+    try:
+        return ezdxf.readfile(path)
+    except Exception:
+        from ezdxf import recover
+        doc, _auditor = recover.readfile(path)
+        return doc
+
 
 # ---------------------------------------------------------------- DWG -> DXF
 # Два движка: AutoCAD Core Console (accoreconsole.exe, идёт с AutoCAD)
@@ -258,7 +269,7 @@ def _clean(s):
 
 def extract(dxf_path, log=print):
     """Возвращает список каналов: dict(mod,type,io,ch,tag,desc,level,ctrl,ex,kc)."""
-    doc = ezdxf.readfile(dxf_path)
+    doc = read_dxf(dxf_path)
     msp = doc.modelspace()
     T = []
     for e in msp:
@@ -463,7 +474,7 @@ def build_docx(template, outfile, io_, word, sections, log=print):
     template  - путь к шаблону-перечню (фирменный вид);
     io_       - 'in' | 'out';
     word      - 'ВХОДНЫЕ' | 'ВЫХОДНЫЕ';
-    sections  - список (имя_раздела, rows) в нужном порядке, напр. ("ШКАФ №1", [...]).
+    sections  - список (имя_раздела, rows) в нужном порядке, напр. ("ШКАФ ШСК2", [...]).
     """
     analog_types = ("AI", "WI") if io_ == "in" else ("AO",)
     doc = Document(template)
@@ -624,6 +635,211 @@ def export_xlsx(sections, path):
     wb.save(path)
     return path
 
+
+# ---------------------------------------------------------- PDF-печать листов
+
+# ГОСТ 2.301: основные и все дополнительные (удлинённые) форматы, мм
+GOST_FORMATS = {
+    "А0": (841, 1189), "А1": (594, 841), "А2": (420, 594), "А3": (297, 420),
+    "А4": (210, 297), "А5": (148, 210),
+    "А0х2": (1189, 1682), "А0х3": (1189, 2523),
+    "А1х3": (841, 1783), "А1х4": (841, 2378),
+    "А2х3": (594, 1261), "А2х4": (594, 1682), "А2х5": (594, 2102),
+    "А3х3": (420, 891), "А3х4": (420, 1189), "А3х5": (420, 1486),
+    "А3х6": (420, 1783), "А3х7": (420, 2080),
+    "А4х3": (297, 630), "А4х4": (297, 841), "А4х5": (297, 1051),
+    "А4х6": (297, 1261), "А4х7": (297, 1471), "А4х8": (297, 1682),
+    "А4х9": (297, 1892),
+}
+
+def _match_format(w, h, tol=3.0):
+    """(имя, ориентация) или None. Ориентация: 'книжная'/'альбомная'."""
+    for name, (a, b) in GOST_FORMATS.items():
+        if abs(w - a) <= tol and abs(h - b) <= tol:
+            return name, "книжная"
+        if abs(w - b) <= tol and abs(h - a) <= tol:
+            return name, "альбомная"
+    return None
+
+def _fix_shx_styles(doc):
+    """SHX-шрифты роняют рендер (битые файлы) — подменяем на ISOCPEUR TTF."""
+    for st in doc.styles:
+        try:
+            f = (st.dxf.font or "").lower()
+            if f.endswith(".shx") or f == "":
+                st.dxf.font = "isocpeur.ttf"
+            if st.dxf.bigfont:
+                st.dxf.bigfont = ""
+        except Exception:
+            pass
+
+def detect_sheets(dxf_path):
+    """Находит рамки листов (замкнутые прямоугольники размеров ГОСТ).
+    Возвращает (doc, [(x0, y0, w, h, имя, ориентация)]) — по строкам, слева направо."""
+    doc = read_dxf(dxf_path)
+    _fix_shx_styles(doc)
+    msp = doc.modelspace()
+    frames, seen = [], set()
+    for e in msp:
+        if e.dxftype() != "LWPOLYLINE" or not e.closed or len(e) not in (4, 5):
+            continue
+        pts = [(pt[0], pt[1]) for pt in e.get_points()]
+        xs = [pt[0] for pt in pts]
+        ys = [pt[1] for pt in pts]
+        w, h = max(xs) - min(xs), max(ys) - min(ys)
+        if w < 100 or h < 100:
+            continue
+        ok = all(abs(px - min(xs)) < 0.05 or abs(px - max(xs)) < 0.05 for px in xs) and \
+             all(abs(py - min(ys)) < 0.05 or abs(py - max(ys)) < 0.05 for py in ys)
+        if not ok:
+            continue
+        m = _match_format(w, h)
+        if not m:
+            continue
+        key = (round(min(xs), 1), round(min(ys), 1))
+        if key in seen:
+            continue
+        seen.add(key)
+        frames.append((min(xs), min(ys), w, h, m[0], m[1]))
+    frames.sort(key=lambda f: (round(-f[1] / 200), f[0]))
+    return doc, frames
+
+def sheets_summary(frames):
+    import collections as _c
+    cnt = _c.Counter(f"{f[4]} {f[5][:3]}." for f in frames)
+    return ", ".join(f"{k}×{v}" for k, v in cnt.most_common())
+
+def export_sheets_pdf(dxf_path, out_pdf, color=False, log=print, progress=None):
+    """Печатает каждый лист чертежа отдельной страницей PDF своего формата 1:1.
+    Возвращает (out_pdf, frames)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    from ezdxf import bbox as _ezbbox
+    from ezdxf.addons.drawing import RenderContext, Frontend
+    from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+    from ezdxf.addons.drawing.config import (Configuration, ColorPolicy,
+                                             BackgroundPolicy)
+    doc, frames = detect_sheets(dxf_path)
+    if not frames:
+        log(f"  ⚠ {os.path.basename(dxf_path)}: рамки листов не найдены — PDF не создан")
+        return None, []
+    log(f"  листов: {len(frames)} ({sheets_summary(frames)})")
+    msp = doc.modelspace()
+    ents, boxes = [], []
+    for e in msp:
+        try:
+            bb = _ezbbox.extents([e], fast=True)
+            if bb.has_data:
+                ents.append(e)
+                boxes.append((bb.extmin.x, bb.extmin.y, bb.extmax.x, bb.extmax.y))
+        except Exception:
+            pass
+    ctx = RenderContext(doc)
+    cfg = Configuration(
+        color_policy=ColorPolicy.COLOR_SWAP_BW if color else ColorPolicy.BLACK,
+        background_policy=BackgroundPolicy.WHITE)
+    with PdfPages(out_pdf) as pdf:
+        for i, (x0, y0, w, h, name, orient) in enumerate(frames, 1):
+            x1, y1 = x0 + w, y0 + h
+            sub = [e for e, (ax0, ay0, ax1, ay1) in zip(ents, boxes)
+                   if ax0 <= x1 + 1 and ax1 >= x0 - 1 and ay0 <= y1 + 1 and ay1 >= y0 - 1]
+            fig = plt.figure(figsize=(w / 25.4, h / 25.4), dpi=300)
+            ax = fig.add_axes([0, 0, 1, 1])
+            ax.set_axis_off()
+            Frontend(ctx, MatplotlibBackend(ax), config=cfg).draw_entities(sub)
+            ax.set_xlim(x0, x1)
+            ax.set_ylim(y0, y1)
+            ax.set_aspect("equal")
+            pdf.savefig(fig)
+            plt.close(fig)
+            if progress:
+                progress(i, len(frames))
+    log(f"  сохранено: {os.path.basename(out_pdf)}")
+    return out_pdf, frames
+
+def export_sheets_pdf_multi(dxf_paths, out_pdf, color=False, log=print, progress=None):
+    """Несколько чертежей -> один PDF (листы подряд, каждый своего формата)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    from ezdxf import bbox as _ezbbox
+    from ezdxf.addons.drawing import RenderContext, Frontend
+    from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+    from ezdxf.addons.drawing.config import (Configuration, ColorPolicy,
+                                             BackgroundPolicy)
+    plan = []
+    for dp in dxf_paths:
+        doc, frames = detect_sheets(dp)
+        if frames:
+            plan.append((dp, doc, frames))
+            log(f"  {os.path.basename(dp)}: {len(frames)} л. ({sheets_summary(frames)})")
+        else:
+            log(f"  ⚠ {os.path.basename(dp)}: рамки листов не найдены — пропущен")
+    if not plan:
+        return None
+    total = sum(len(f) for _p, _d, f in plan)
+    done = 0
+    cfg = Configuration(
+        color_policy=ColorPolicy.COLOR_SWAP_BW if color else ColorPolicy.BLACK,
+        background_policy=BackgroundPolicy.WHITE)
+    with PdfPages(out_pdf) as pdf:
+        for _dp, doc, frames in plan:
+            msp = doc.modelspace()
+            ents, boxes = [], []
+            for e in msp:
+                try:
+                    bb = _ezbbox.extents([e], fast=True)
+                    if bb.has_data:
+                        ents.append(e)
+                        boxes.append((bb.extmin.x, bb.extmin.y, bb.extmax.x, bb.extmax.y))
+                except Exception:
+                    pass
+            ctx = RenderContext(doc)
+            for (x0, y0, w, h, _name, _orient) in frames:
+                x1, y1 = x0 + w, y0 + h
+                sub = [e for e, (ax0, ay0, ax1, ay1) in zip(ents, boxes)
+                       if ax0 <= x1 + 1 and ax1 >= x0 - 1 and ay0 <= y1 + 1 and ay1 >= y0 - 1]
+                fig = plt.figure(figsize=(w / 25.4, h / 25.4), dpi=300)
+                ax = fig.add_axes([0, 0, 1, 1])
+                ax.set_axis_off()
+                Frontend(ctx, MatplotlibBackend(ax), config=cfg).draw_entities(sub)
+                ax.set_xlim(x0, x1)
+                ax.set_ylim(y0, y1)
+                ax.set_aspect("equal")
+                pdf.savefig(fig)
+                plt.close(fig)
+                done += 1
+                if progress:
+                    progress(done, total)
+    log(f"  сохранено: {os.path.basename(out_pdf)} ({total} л.)")
+    return out_pdf
+
+def export_pdf_batch(drawings, out_dir, color=False, oda_exe=None, log=print, progress=None):
+    """DWG/DXF -> по одному PDF на чертёж (полистно). Возвращает список PDF."""
+    items = [(d, None) if isinstance(d, str) else (d[0], d[1]) for d in drawings]
+    dwgs = [p for p, _n in items if p.lower().endswith(".dwg")]
+    conv = {}
+    if dwgs:
+        engine, exe = ("oda", oda_exe) if oda_exe else find_converter()
+        conv = dwg_to_dxf(dwgs, engine=engine, exe=exe, log=log)
+        missing = [p for p in dwgs if p not in conv]
+        if missing:
+            raise RuntimeError("Не сконвертировались: " +
+                               ", ".join(os.path.basename(m) for m in missing))
+    os.makedirs(out_dir, exist_ok=True)
+    results = []
+    for p, _name in items:
+        dxf = conv.get(p, p)
+        log(f"Печать: {os.path.basename(p)}")
+        out = os.path.join(out_dir, os.path.splitext(os.path.basename(p))[0] + ".pdf")
+        r, _fr = export_sheets_pdf(dxf, out, color=color, log=log, progress=progress)
+        if r:
+            results.append(r)
+    return results
+
 # ------------------------------------------------- разделы из Excel-сводки
 
 def sections_from_xlsx(path, log=print):
@@ -747,7 +963,7 @@ def extract_equipment(dxf_path):
     """Состав шкафа из чертежа: модули (по заголовкам), блоки/клеммы (по вставкам).
     Возвращает список (элемент, артикул, кол-во, примечание)."""
     import collections
-    doc = ezdxf.readfile(dxf_path)
+    doc = read_dxf(dxf_path)
     msp = doc.modelspace()
     texts, inserts = [], collections.Counter()
     for e in msp:
@@ -1147,7 +1363,7 @@ def generate_scheme(donor_dxf, out_dxf, sections, types=("AI", "AO"), log=print)
     Донор — фирменный чертёж, из которого берётся по одному заполненному листу
     каждого типа; на каждый модуль из sections печатается свой лист."""
     from ezdxf.math import Matrix44
-    doc = ezdxf.readfile(donor_dxf)
+    doc = read_dxf(donor_dxf)
     msp = doc.modelspace()
     frames = _sheet_frames(msp)
     if not frames:

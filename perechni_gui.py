@@ -6,7 +6,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import perechni_core as core
 
-APP_VER = "2.4"
+APP_VER = "2.5"
 APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 CFG = os.path.join(APP_DIR, "config.json")
 ICON = os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "app.ico")
@@ -26,6 +26,27 @@ PALETTES = {
      ERR="#e0705c", ROW_ALT="#383836", FIELD="#262624", BTN2="#3e3d3a", BTN2A="#4a4947",
      SEL="#54423a", DIFF_A="#2f4a2c", DIFF_D="#57302a", DIFF_C="#57492a", RES="#78756c"),
 }
+
+def system_theme():
+    """Тема оформления Windows: 'dark' | 'light'.
+
+    Нужна, чтобы при первом запуске приложение выглядело так же, как система,
+    а не всегда светлым. Свой выбор пользователя сохраняется в настройках
+    и дальше имеет приоритет над системным.
+    """
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        try:
+            val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        finally:
+            winreg.CloseKey(key)
+        return "light" if val else "dark"
+    except Exception:
+        return "light"
+
 
 def set_theme(name):
     globals().update(PALETTES.get(name, PALETTES["light"]))
@@ -57,9 +78,21 @@ def load_cfg():
 
 
 def save_cfg(d):
+    """Сохраняет состояние интерфейса, не затирая чужие ключи.
+
+    В этом же файле лежат настройки разбора (`extract`, `abbrev`,
+    `auto_layers`, `pdf_a`, пути к конвертерам). Раньше словарь писался
+    целиком, и всё, чего не знает интерфейс, пропадало при первом же
+    сохранении. Поэтому дописываем поверх прочитанного.
+    """
+    try:
+        cur = load_cfg()
+    except Exception:
+        cur = {}
+    cur.update(d)
     try:
         with open(CFG, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=1)
+            json.dump(cur, f, ensure_ascii=False, indent=1)
     except Exception:
         pass
 
@@ -234,7 +267,7 @@ NAV = [("home", "◈", "Дашборд"),
 
 class App(BaseTk):
     def __init__(self):
-        set_theme(load_cfg().get("theme", "light"))
+        set_theme(load_cfg().get("theme") or system_theme())
         super().__init__()
         self.title("Перечни сигналов из схем подключения")
         self.configure(bg=BG)
@@ -245,7 +278,7 @@ class App(BaseTk):
         except Exception:
             pass
         cfg = load_cfg()
-        self.theme = cfg.get("theme", "light")
+        self.theme = cfg.get("theme") or system_theme()
         self.option_add("*TCombobox*Listbox.background", CARD)
         self.option_add("*TCombobox*Listbox.foreground", TEXT)
         self.option_add("*TCombobox*Listbox.selectBackground", SEL)
@@ -256,6 +289,7 @@ class App(BaseTk):
         self.var_upd = tk.BooleanVar(value=cfg.get("update_fields", True))
         self.var_pdf = tk.BooleanVar(value=cfg.get("make_pdf", False))
         self.var_rev = tk.BooleanVar(value=cfg.get("revisions", True))
+        self.var_manifest = tk.BooleanVar(value=cfg.get("manifest", True))
         self.var_cdst = tk.StringVar(value=cfg.get("conv_dir", ""))
         self.var_pdfdst = tk.StringVar(value=cfg.get("pdf_dir", ""))
         self.var_pdfcolor = tk.BooleanVar(value=cfg.get("pdf_color", False))
@@ -380,10 +414,22 @@ class App(BaseTk):
 
         logc = Card(main, "Журнал")
         logc.pack(fill="x", padx=16, pady=(2, 12))
+        logbar = tk.Frame(logc.body, bg=CARD)
+        logbar.pack(fill="x", pady=(0, 2))
+        # Замечания тонут в обычных сообщениях, а именно их и надо видеть.
+        # Полный текст никуда не девается — переключатель только фильтрует показ.
+        self.only_warn = tk.BooleanVar(value=False)
+        tk.Checkbutton(logbar, text="только замечания", variable=self.only_warn,
+                       command=self._relog, font=FONT_SM, bg=CARD, fg=TEXT,
+                       activebackground=CARD, selectcolor=FIELD).pack(side="left")
+        self.warn_stat = tk.Label(logbar, text="", font=FONT_SM, bg=CARD, fg=MUTED)
+        self.warn_stat.pack(side="left", padx=(10, 0))
+        flat_btn(logbar, "⭳ Сохранить журнал…", self.save_log).pack(side="right")
         self.txt = tk.Text(logc.body, height=6, state="disabled", font=FONT_MONO,
                            bg=FIELD, fg=TEXT, relief="flat",
                            highlightbackground=BORDER, highlightthickness=1)
         self.txt.pack(fill="both", expand=True)
+        self.log_lines = []          # весь журнал целиком, независимо от фильтра
 
         self.pages = {
             "home": self._page_home(self.page_area),
@@ -399,6 +445,11 @@ class App(BaseTk):
         self.current = None
         if HAS_DND:
             self._enable_dnd()
+        else:
+            # раньше отсутствие библиотеки просто отключало перетаскивание,
+            # и пользователь думал, что такой возможности нет вовсе
+            self.log("Перетаскивание файлов недоступно: не установлен tkinterdnd2. "
+                     "Файлы добавляются кнопкой. Включить: pip install tkinterdnd2", MUTED)
 
 
     def _enable_dnd(self):
@@ -407,9 +458,26 @@ class App(BaseTk):
             tree.dnd_bind("<<Drop>>", lambda e: handler(
                 [f for f in self.tk.splitlist(e.data)
                  if os.path.splitext(f)[1].lower() in exts]))
-        bind_drop(self.fl.tree, (".dxf", ".dwg"), self._drop_build)
+        bind_drop(self.fl.tree, (".dxf", ".dwg", ".xlsx"), self._drop_build)
         bind_drop(self.cl.tree, (".dwg",), self._drop_conv)
         bind_drop(self.pl.tree, (".dxf", ".dwg"), self._drop_pdf)
+        # перечни .docx — на поля страницы «Сравнение версий»
+        for widget, var in ((getattr(self, "old_in_row", None), self.var_old_in),
+                            (getattr(self, "old_out_row", None), self.var_old_out)):
+            if widget is None:
+                continue
+            try:
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", lambda e, v=var: self._drop_docx(e, v))
+            except Exception:
+                pass
+
+    def _drop_docx(self, event, var):
+        files = [f for f in self.tk.splitlist(event.data)
+                 if os.path.splitext(f)[1].lower() == ".docx"]
+        if files:
+            var.set(files[0])
+            self.log("Перетащен перечень: " + os.path.basename(files[0]))
 
     def _drop_build(self, files):
         for f in files:
@@ -456,9 +524,49 @@ class App(BaseTk):
         return h
 
     # ------------------------------------------------------------- стр. Дашборд
+    def _build_readiness(self, parent):
+        """Строка готовности: что есть на этом компьютере, чего не хватает.
+
+        Раньше об ограничениях (нет конвертера DWG, нет Word) человек узнавал,
+        только наткнувшись на ошибку посреди работы. Проверка идёт в фоне —
+        поиск конвертера ходит по дискам и может занять секунду-другую.
+        """
+        card = Card(parent, "Готовность", "что доступно на этом компьютере")
+        card.pack(fill="x", padx=16, pady=(4, 2))
+        self.ready_box = tk.Frame(card.body, bg=CARD)
+        self.ready_box.pack(fill="x")
+        tk.Label(self.ready_box, text="проверяю…", font=FONT_SM,
+                 bg=CARD, fg=MUTED).pack(anchor="w")
+        threading.Thread(target=self._readiness_work, daemon=True).start()
+        return card
+
+    def _readiness_work(self):
+        try:
+            rows = core.readiness()
+        except Exception as e:
+            rows = [(False, "Проверка готовности", "не удалась", str(e))]
+        self.after(0, self._readiness_show, rows)
+
+    def _readiness_show(self, rows):
+        for w in self.ready_box.winfo_children():
+            w.destroy()
+        for ok_, name, detail, cons in rows:
+            line = tk.Frame(self.ready_box, bg=CARD)
+            line.pack(fill="x", anchor="w")
+            tk.Label(line, text=("✓" if ok_ else "✗"), font=FONT_SM, bg=CARD,
+                     fg=(OK if ok_ else ERR), width=2).pack(side="left")
+            tk.Label(line, text=name + ":", font=FONT_SM, bg=CARD, fg=TEXT,
+                     width=17, anchor="w").pack(side="left")
+            tk.Label(line, text=detail, font=FONT_SM, bg=CARD,
+                     fg=(TEXT if ok_ else ERR), anchor="w").pack(side="left")
+            if cons:
+                tk.Label(line, text="— " + cons, font=FONT_SM, bg=CARD,
+                         fg=MUTED, anchor="w", justify="left").pack(side="left", padx=(6, 0))
+
     def _page_home(self, parent):
         fr = tk.Frame(parent, bg=BG)
         self._header(fr, "Дашборд", "сводка проекта и быстрые действия")
+        self._build_readiness(fr)
         bar = tk.Frame(fr, bg=BG)
         bar.pack(fill="x", padx=16, pady=(2, 4))
         flat_btn(bar, "Прочитать чертежи", self.read_signals, primary=True).pack(side="left")
@@ -511,9 +619,12 @@ class App(BaseTk):
         sb = ttk.Scrollbar(c2.body, orient="vertical", command=self.fg_tree.yview)
         self.fg_tree.configure(yscrollcommand=sb.set)
         sb.pack(side="left", fill="y")
-        self.dash_hint = tk.Label(fr, text="Нажмите «Прочитать чертежи» (список — на «Сборке»), "
-                                           "чтобы увидеть сводку.",
-                                  font=FONT_SM, bg=BG, fg=MUTED)
+        self.dash_hint = tk.Label(
+            fr,
+            text="С чего начать:  1) слева откройте «Сборка перечней» и добавьте чертежи "
+                 "(DWG или DXF)  →  2) вернитесь сюда и нажмите «Прочитать чертежи».   "
+                 "Нет чертежей под рукой — добавьте examples\\demo-signals.xlsx, это демо.",
+            font=FONT_SM, bg=BG, fg=MUTED, justify="left")
         self.dash_hint.pack(anchor="w", padx=18, pady=(0, 6))
         return fr
 
@@ -666,15 +777,9 @@ class App(BaseTk):
         self.fl.add_cb = self.add_drawings
         self.fl.pack(fill="both", expand=True)
 
-        c2 = Card(fr, "2. Шаблоны перечней",
-                  "любой прежний перечень .docx — таблицы заменятся, рамки сохранятся")
-        c2.pack(fill="x", padx=16, pady=5)
-        PathRow(c2.body, "Входные сигналы:", self.var_in,
-                lambda: self._pick(self.var_in, [("Word", "*.docx")])).pack(fill="x", pady=2)
-        PathRow(c2.body, "Выходные сигналы:", self.var_out,
-                lambda: self._pick(self.var_out, [("Word", "*.docx")])).pack(fill="x", pady=2)
-
-        c3 = Card(fr, "3. Результат")
+        # Шаблоны переехали в «Настройки»: по умолчанию берутся встроенные,
+        # и два поля выбора файла на первом экране только сбивали с толку.
+        c3 = Card(fr, "2. Результат")
         c3.pack(fill="x", padx=16, pady=5)
         PathRow(c3.body, "Папка результата:", self.var_dst,
                 lambda: self._pickdir(self.var_dst)).pack(fill="x", pady=2)
@@ -684,9 +789,18 @@ class App(BaseTk):
         tk.Checkbutton(c3.body, text="Сохранить также в PDF (через Word)",
                        variable=self.var_pdf, font=FONT_SM, bg=CARD, fg=TEXT,
                        activebackground=CARD, selectcolor=FIELD).pack(anchor="w")
-        tk.Checkbutton(c3.body, text="Пакет — в папку-ревизию с манифестом",
+        # Раньше одна галочка управляла двумя разными вещами: и папкой-ревизией,
+        # и паспортом выпуска. Паспорт полезен всегда, поэтому он теперь
+        # отдельный и включён по умолчанию.
+        tk.Checkbutton(c3.body, text="Складывать в папку-ревизию (Ревизия NN — дата)",
                        variable=self.var_rev, font=FONT_SM, bg=CARD, fg=TEXT,
-                       activebackground=CARD, selectcolor=FIELD, activeforeground=TEXT).pack(anchor="w")
+                       activebackground=CARD, selectcolor=FIELD,
+                       activeforeground=TEXT).pack(anchor="w")
+        tk.Checkbutton(c3.body,
+                       text="Писать паспорт выпуска (из каких чертежей собрано и сошлась ли сверка)",
+                       variable=self.var_manifest, font=FONT_SM, bg=CARD, fg=TEXT,
+                       activebackground=CARD, selectcolor=FIELD,
+                       activeforeground=TEXT).pack(anchor="w")
 
         run = tk.Frame(fr, bg=BG)
         run.pack(fill="x", padx=16, pady=(4, 6))
@@ -697,6 +811,8 @@ class App(BaseTk):
         self.btn_pack.pack(side="left", padx=(8, 0))
         self.btn_open = flat_btn(run, "📂 Открыть папку",
                                  lambda: self._open_dir(self.var_dst.get()))
+        self.btn_verify = flat_btn(run, "⚖ Отчёт сверки…", self.export_verify)
+        self.verify_result = None
         self.prog = ttk.Progressbar(run, mode="indeterminate",
                                     style="Blue.Horizontal.TProgressbar", length=200)
         self.status = tk.Label(run, text="", font=FONT_SM, bg=BG, fg=MUTED)
@@ -714,6 +830,7 @@ class App(BaseTk):
         flat_btn(bar, "⭳ Экспорт в Excel", self.export_xlsx).pack(side="left", padx=(8, 0))
         flat_btn(bar, "✓ Проверки", self.run_checks).pack(side="left", padx=(8, 0))
         flat_btn(bar, "⌖ В AutoCAD", self.show_in_acad).pack(side="left", padx=(8, 0))
+        flat_btn(bar, "⎙ Лист в PDF", self.show_sheet_pdf).pack(side="left", padx=(8, 0))
         tk.Label(bar, text="Тип:", font=FONT_SM, bg=BG, fg=MUTED).pack(side="left", padx=(16, 4))
         self.f_type = ttk.Combobox(bar, values=["Все", "AI", "AO", "DI", "DO", "WI", "Резерв"],
                                    width=8, state="readonly", font=FONT_SM)
@@ -786,16 +903,64 @@ class App(BaseTk):
         except Exception as e:
             messagebox.showerror("AutoCAD", str(e))
 
+    def show_sheet_pdf(self):
+        """Печатает лист, на котором лежит выбранный канал, и открывает его.
+
+        Переход «в AutoCAD» требует установленного CAD, а посмотреть, откуда
+        взялась строка, нужно и без него. Печатается только один лист —
+        это секунды, а не минуты на весь чертёж.
+        """
+        sel = self.sg.selection()
+        if not sel:
+            messagebox.showwarning("Лист в PDF", "Выберите строку в таблице сигналов.")
+            return
+        d = self.sg_rows.get(sel[0])
+        if not d:
+            return
+        src = d.get("src") or ""
+        if not src or not os.path.exists(src):
+            messagebox.showwarning(
+                "Лист в PDF",
+                "Неизвестно, из какого чертежа эта строка. "
+                "Так бывает, когда данные прочитаны из Excel-сводки.")
+            return
+        self.log("Печать листа с каналом %s..." % d.get("kc", ""))
+        threading.Thread(target=self._sheet_pdf_work, args=(src, d), daemon=True).start()
+
+    def _sheet_pdf_work(self, src, d):
+        import tempfile
+        try:
+            if src.lower().endswith(".dwg"):
+                conv = core.dwg_to_dxf([src], log=self._logcb())
+                src = conv.get(src, src)
+            out = os.path.join(tempfile.mkdtemp(prefix="perechni_sheet_"),
+                               "Канал %s.pdf" % str(d.get("kc", "")).replace(".", "-"))
+            p, note = core.export_channel_sheet_pdf(src, d.get("x"), d.get("y"),
+                                                    out, log=self._logcb())
+            if not p:
+                self.after(0, self.log, "не удалось: " + note, ERR)
+                self.after(0, lambda: messagebox.showwarning("Лист в PDF", note))
+                return
+            self.after(0, self.log, "открываю: " + note, OK)
+            os.startfile(p)
+        except Exception as e:
+            self.after(0, self.log, "ОШИБКА: " + str(e), ERR)
+            self.error_box("Лист в PDF", e)
+
     # -------------------------------------------------------- стр. Спецификация
     def _page_spec(self, parent):
         fr = tk.Frame(parent, bg=BG)
-        self._header(fr, "Спецификация", "состав шкафов по чертежам — заготовка СО и ведомость КИП")
+        self._header(fr, "Спецификация",
+                     "шкафы — в спецификацию по ГОСТ, их начинка — в ведомость комплектации")
         bar = tk.Frame(fr, bg=BG)
         bar.pack(fill="x", padx=16, pady=(2, 4))
         self.qbtn = flat_btn(bar, "Прочитать состав", self.read_spec, primary=True)
         self.qbtn.pack(side="left")
-        flat_btn(bar, "⭳ Экспорт в Excel", self.export_spec).pack(side="left", padx=(8, 0))
-        flat_btn(bar, "⭳ Заготовка ПЗ (Word)", self.export_pz).pack(side="left", padx=(8, 0))
+        flat_btn(bar, "⭳ Спецификация (Word)", self.export_spec).pack(side="left", padx=(8, 0))
+        flat_btn(bar, "⭳ Ведомость комплектации (Excel)",
+                 self.export_vedom).pack(side="left", padx=(8, 0))
+        flat_btn(bar, "⭳ Пояснительная записка (Word)",
+                 self.export_pz).pack(side="left", padx=(8, 0))
         self.qprog = ttk.Progressbar(bar, mode="indeterminate",
                                      style="Blue.Horizontal.TProgressbar", length=200)
         self.spec_stat = tk.Label(bar, text="", font=FONT_SM, bg=BG, fg=MUTED)
@@ -846,25 +1011,54 @@ class App(BaseTk):
             self.after(0, show)
         except Exception as e:
             self.after(0, self.log, "ОШИБКА: " + str(e), ERR)
-            self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+            self.error_box("Ошибка", e)
         finally:
             self.after(0, self.qprog.stop)
             self.after(0, self.qprog.pack_forget)
             self.after(0, lambda: self.qbtn.configure(state="normal", bg=ACCENT))
 
+    def _cab_names(self):
+        """Имена шкафов проекта: из состава, иначе из разделов перечня."""
+        return ([n for n, _i in (self.equip or [])]
+                or [n for n, _r in (self.sections or [])])
+
     def export_spec(self):
+        if not self.equip and not self.sections:
+            messagebox.showwarning("Нет данных", "Сначала «Прочитать состав».")
+            return
+        tpl = core.default_template("spec")
+        if not tpl:
+            messagebox.showerror(
+                "Нет шаблона",
+                "Не найден шаблон templates/Спецификация оборудования и материалов.docx. "
+                "Положите шаблон рядом с программой.")
+            return
+        p = filedialog.asksaveasfilename(
+            defaultextension=".docx", filetypes=[("Word", "*.docx")],
+            initialfile="Спецификация оборудования и материалов.docx")
+        if not p:
+            return
+        try:
+            core.build_spec_docx(tpl, p, core.spec_sections_for_cabs(self._cab_names()),
+                                 log=self.log)
+            self.log(f"Спецификация сохранена: {p}", OK)
+            self.log(core.SPEC_EXCLUDED_NOTE)
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
+
+    def export_vedom(self):
+        """Ведомость комплектации шкафов — рабочий документ, не спецификация."""
         if not self.equip:
             messagebox.showwarning("Нет данных", "Сначала «Прочитать состав».")
             return
         p = filedialog.asksaveasfilename(defaultextension=".xlsx",
                                          filetypes=[("Excel", "*.xlsx")],
-                                         initialfile="Спецификация (заготовка).xlsx")
+                                         initialfile="Ведомость комплектации шкафов.xlsx")
         if not p:
             return
         try:
-            secs = self.sections or []
-            core.export_spec_xlsx(self.equip, secs, p)
-            self.log(f"Спецификация сохранена: {p}", OK)
+            core.export_spec_xlsx(self.equip, self.sections or [], p)
+            self.log(f"Ведомость комплектации сохранена: {p}", OK)
         except Exception as e:
             messagebox.showerror("Ошибка", str(e))
 
@@ -875,12 +1069,19 @@ class App(BaseTk):
             return
         p = filedialog.asksaveasfilename(defaultextension=".docx",
                                          filetypes=[("Word", "*.docx")],
-                                         initialfile="ПЗ раздел Автоматизация (заготовка).docx")
+                                         initialfile="Пояснительная записка.docx")
         if not p:
             return
         try:
-            core.export_pz_docx(self.sections or [], self.equip or [], p)
-            self.log(f"Заготовка ПЗ сохранена: {p}", OK)
+            tpl = core.default_template("pz")
+            if tpl:
+                core.build_pz_docx(tpl, p, self.sections or [], self.equip or [],
+                                   log=self.log)
+            else:
+                # без шаблона запиской занимается прежний путь: лист без рамки
+                core.export_pz_docx(self.sections or [], self.equip or [], p)
+                self.log("шаблон записки не найден — документ без рамки и штампа", ERR)
+            self.log(f"Пояснительная записка сохранена: {p}", OK)
         except Exception as e:
             messagebox.showerror("Ошибка", str(e))
 
@@ -935,7 +1136,7 @@ class App(BaseTk):
                 lambda: self._pickdir(self.var_pdfdst)).pack(fill="x", pady=2)
         tk.Label(c2.body, text="(пусто — PDF сохранится рядом с чертежом)", font=FONT_SM,
                  bg=CARD, fg=MUTED).pack(anchor="w", padx=(150, 0))
-        tk.Checkbutton(c2.body, text="Цветная печать (по умолчанию — чёрно-белая)",
+        tk.Checkbutton(c2.body, text="Цветная печать (по умолчанию — монохром, как в AutoCAD)",
                        variable=self.var_pdfcolor, font=FONT_SM, bg=CARD, fg=TEXT,
                        activebackground=CARD, selectcolor=FIELD,
                        activeforeground=TEXT).pack(anchor="w", pady=(3, 0))
@@ -1056,7 +1257,7 @@ class App(BaseTk):
         except Exception as e:
             self.after(0, self.log, "ОШИБКА: " + str(e), ERR)
             self.after(0, lambda: self.pstat.configure(text="ошибка", fg=ERR))
-            self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+            self.error_box("Ошибка", e)
         finally:
             self.after(0, self.pprog.pack_forget)
             self.after(0, lambda: self.pbtn.configure(state="normal", bg=ACCENT))
@@ -1068,14 +1269,21 @@ class App(BaseTk):
                      "что изменилось в чертежах относительно прежних перечней")
         c1 = Card(fr, "Прежние перечни (.docx)")
         c1.pack(fill="x", padx=16, pady=5)
-        PathRow(c1.body, "Входные сигналы:", self.var_old_in,
-                lambda: self._pick(self.var_old_in, [("Word", "*.docx")])).pack(fill="x", pady=2)
-        PathRow(c1.body, "Выходные сигналы:", self.var_old_out,
-                lambda: self._pick(self.var_old_out, [("Word", "*.docx")])).pack(fill="x", pady=2)
+        self.old_in_row = PathRow(c1.body, "Входные сигналы:", self.var_old_in,
+                                  lambda: self._pick(self.var_old_in, [("Word", "*.docx")]))
+        self.old_in_row.pack(fill="x", pady=2)
+        self.old_out_row = PathRow(c1.body, "Выходные сигналы:", self.var_old_out,
+                                   lambda: self._pick(self.var_old_out, [("Word", "*.docx")]))
+        self.old_out_row.pack(fill="x", pady=2)
+        tk.Label(c1.body, text="файлы можно перетащить сюда мышью",
+                 font=FONT_SM, bg=CARD, fg=MUTED).pack(anchor="w", pady=(2, 0))
         bar = tk.Frame(fr, bg=BG)
         bar.pack(fill="x", padx=16, pady=(2, 4))
         self.dbtn = flat_btn(bar, "Сравнить", self.run_diff, primary=True)
         self.dbtn.pack(side="left")
+        # Сверка отличается от сравнения: там две редакции и расхождения
+        # ожидаемы, здесь источник один и любое расхождение — дефект выпуска.
+        flat_btn(bar, "⚖ Сверить с чертежами", self.run_verify).pack(side="left", padx=(8, 0))
         flat_btn(bar, "⭳ Сохранить отчёт Excel", self.export_diff).pack(side="left", padx=(8, 0))
         self.dprog = ttk.Progressbar(bar, mode="indeterminate",
                                      style="Blue.Horizontal.TProgressbar", length=200)
@@ -1116,6 +1324,17 @@ class App(BaseTk):
                  font=FONT_SM, bg=CARD, fg=MUTED).pack(anchor="w", pady=(2, 0))
         self.engine_lbl2 = tk.Label(c.body, text="", font=FONT_SM, bg=CARD)
         self.engine_lbl2.pack(anchor="w", pady=(4, 0))
+        ct = Card(fr, "Шаблоны перечней",
+                  "по умолчанию встроенные; свой шаблон — любой прежний перечень .docx")
+        ct.pack(fill="x", padx=16, pady=5)
+        PathRow(ct.body, "Входные сигналы:", self.var_in,
+                lambda: self._pick(self.var_in, [("Word", "*.docx")])).pack(fill="x", pady=2)
+        PathRow(ct.body, "Выходные сигналы:", self.var_out,
+                lambda: self._pick(self.var_out, [("Word", "*.docx")])).pack(fill="x", pady=2)
+        tk.Label(ct.body, text="Пусто — используются шаблоны из папки templates "
+                               "рядом с программой.",
+                 font=FONT_SM, bg=CARD, fg=MUTED).pack(anchor="w", pady=(2, 0))
+
         c2 = Card(fr, "Оформление")
         c2.pack(fill="x", padx=16, pady=5)
         self.var_dark = tk.BooleanVar(value=self.theme == "dark")
@@ -1234,9 +1453,15 @@ class App(BaseTk):
         if hasattr(self, "engine_lbl2"):
             self.engine_lbl2.configure(text=t, fg=c)
 
-    def log(self, s, color=None):
-        import time as _t
-        s = _t.strftime("%H:%M  ") + s
+    @staticmethod
+    def _is_warn(s):
+        """Строка-замечание: то, что инженер должен увидеть обязательно."""
+        low = s.lower()
+        return ("⚠" in s or "ВНИМАНИЕ" in s or "ОШИБКА" in s
+                or "не удалось" in low or "не найден" in low
+                or "расхожден" in low or "ПЛОХО" in s)
+
+    def _put_line(self, s, color=None):
         self.txt.configure(state="normal")
         self.txt.insert("end", s + "\n")
         if color:
@@ -1247,6 +1472,58 @@ class App(BaseTk):
         self.txt.see("end")
         self.txt.configure(state="disabled")
 
+    def log(self, s, color=None):
+        import time as _t
+        s = _t.strftime("%H:%M  ") + s
+        self.log_lines.append((s, color))
+        warn = self._is_warn(s)
+        n_warn = sum(1 for t, _c in self.log_lines if self._is_warn(t))
+        self.warn_stat.configure(text=("замечаний: %d" % n_warn) if n_warn else "",
+                                 fg=(ERR if n_warn else MUTED))
+        if self.only_warn.get() and not warn:
+            return
+        self._put_line(s, color or (WARN if warn else None))
+
+    def _relog(self):
+        """Перерисовывает журнал по текущему фильтру."""
+        self.txt.configure(state="normal")
+        self.txt.delete("1.0", "end")
+        self.txt.configure(state="disabled")
+        only = self.only_warn.get()
+        for s, color in self.log_lines:
+            warn = self._is_warn(s)
+            if only and not warn:
+                continue
+            self._put_line(s, color or (WARN if warn else None))
+
+    def save_log(self):
+        """Сохраняет журнал целиком — независимо от того, что показано."""
+        if not self.log_lines:
+            messagebox.showinfo("Журнал", "Журнал пуст.")
+            return
+        import datetime
+        p = filedialog.asksaveasfilename(
+            defaultextension=".txt", filetypes=[("Текст", "*.txt")],
+            initialfile="Журнал %s.txt" % datetime.datetime.now().strftime("%d.%m.%Y %H-%M"))
+        if not p:
+            return
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("\n".join(s for s, _c in self.log_lines) + "\n")
+            self.log("Журнал сохранён: " + p, OK)
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
+
+    def error_box(self, title, exc):
+        """Показать ошибку из фонового потока.
+
+        Текст берём сразу: имя из `except ... as exc` живёт только внутри
+        своего блока, и лямбда, вызванная позже из очереди Tk, его уже не
+        находит — вместо сообщения об ошибке всплывает NameError.
+        """
+        msg = str(exc) or type(exc).__name__
+        self.after(0, lambda: messagebox.showerror(title, msg))
+
     def _logcb(self):
         return lambda s: self.after(0, self.log, s, WARN if "ВНИМАНИЕ" in s else None)
 
@@ -1254,6 +1531,7 @@ class App(BaseTk):
         save_cfg(dict(theme=self.theme,
                       template_in=self.var_in.get(), template_out=self.var_out.get(),
                       out_dir=self.var_dst.get(), update_fields=self.var_upd.get(), make_pdf=self.var_pdf.get(), revisions=self.var_rev.get(),
+                      manifest=self.var_manifest.get(),
                       conv_dir=self.var_cdst.get(), conv_add=self.var_addlist.get(),
                       pdf_dir=self.var_pdfdst.get(), pdf_color=self.var_pdfcolor.get(),
                       pdf_one=self.var_pdfone.get(),
@@ -1296,7 +1574,7 @@ class App(BaseTk):
             self.after(0, self._dash_refresh)
         except Exception as e:
             self.after(0, self.log, "ОШИБКА: " + str(e), ERR)
-            self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+            self.error_box("Ошибка", e)
         finally:
             self.after(0, lambda: self.sbtn.configure(state="normal", bg=ACCENT))
 
@@ -1330,7 +1608,19 @@ class App(BaseTk):
                                              d["desc"], d["ex"]))
                 self.sg_rows[iid] = d
                 shown += 1
-        self.sig_stat.configure(text=f"показано {shown} из {n}")
+        # Резерв стоит считать отдельно: это единственное место, где видно
+        # разницу между «канал свободен» и «программа не разобрала описание».
+        res = sum(1 for _c, rows in self.sections for d in rows
+                  if d["desc"] == "Резерв")
+        notag = sum(1 for _c, rows in self.sections for d in rows
+                    if d["desc"] != "Резерв" and not d["tag"])
+        parts = [f"показано {shown} из {n}"]
+        if res:
+            parts.append(f"резерв {res} ({res * 100 // n if n else 0}%)")
+        if notag:
+            parts.append(f"без позиции {notag}")
+        self.sig_stat.configure(text="   ·   ".join(parts),
+                                fg=(ERR if res > n * 0.7 else MUTED))
 
     def edit_signal(self, ev):
         it = self.sg.identify_row(ev.y)
@@ -1462,8 +1752,12 @@ class App(BaseTk):
         if not items:
             messagebox.showwarning("Нет чертежей", "Добавьте хотя бы один чертёж.")
             return
-        if not (t_in or t_out):
-            messagebox.showwarning("Нет шаблонов", "Укажите шаблон входных и/или выходных сигналов.")
+        if (not (t_in or t_out) and not core.default_template("in")
+                and not core.default_template("out")):
+            messagebox.showwarning(
+                "Нет шаблонов",
+                "Не найдены встроенные шаблоны в папке templates рядом с программой. "
+                "Укажите шаблон входных и/или выходных сигналов вручную.")
             return
         if not dst:
             messagebox.showwarning("Нет папки", "Укажите папку результата.")
@@ -1491,29 +1785,138 @@ class App(BaseTk):
                 edits = sum(1 for _c, rows in secs for r in rows if r.get("_edited"))
                 if edits:
                     self.after(0, self.log, f"Использую данные предпросмотра (правок: {edits})")
+            if secs is None:
+                # читаем один раз здесь, чтобы одни и те же данные пошли
+                # и в сборку, и в сверку — иначе сверять было бы не с чем
+                secs = core.read_sections(items, log=self._logcb())
             results = core.run(items, t_in or None, t_out or None, dst,
                                log=self._logcb(), update_fields=self.var_upd.get(),
                                sections=secs, make_pdf=self.var_pdf.get())
             self.after(0, self.log, "ГОТОВО: " + "; ".join(os.path.basename(r) for r in results), OK)
+            # Сверка сразу после сборки: инженер должен видеть подтверждение,
+            # что в документ попало всё, а не верить на слово.
+            self.after(0, self.log, "Сверка перечней с чертежами...")
+            try:
+                ver = core.verify_perechen(secs, results, log=self._logcb())
+                self.verify_result = ver
+                if ver["ok"]:
+                    self.after(0, self.log, "СВЕРКА ПРОЙДЕНА: расхождений нет", OK)
+                else:
+                    self.after(0, self.log,
+                               "СВЕРКА: расхождений %d — подробности в журнале"
+                               % len(ver["issues"]), ERR)
+                # Отчёт сохраняем сразу: иначе он живёт до следующей сборки,
+                # и потом не восстановить, когда именно разошлось.
+                try:
+                    import datetime
+                    hist = os.path.join(dst, "Сверки")
+                    os.makedirs(hist, exist_ok=True)
+                    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H-%M")
+                    verdict = "сошлось" if ver["ok"] else "расхождений %d" % len(ver["issues"])
+                    rp = os.path.join(hist, "Сверка %s — %s.xlsx" % (stamp, verdict))
+                    core.export_verify_xlsx(ver, rp)
+                    self.after(0, self.log, "отчёт сверки: " + rp, MUTED)
+                except Exception as se:
+                    self.after(0, self.log, "не удалось сохранить отчёт сверки: " + str(se), MUTED)
+                self.after(0, lambda: self.btn_verify.pack(side="left", padx=(8, 0)))
+            except Exception as ve:
+                self.after(0, self.log, "сверка не выполнена: " + str(ve), MUTED)
             self.after(0, lambda: self.status.configure(text="Готово ✓", fg=OK))
             self.after(0, lambda: self.btn_open.pack(side="left", padx=(8, 0)))
         except Exception as e:
             self.after(0, self.log, "ОШИБКА: " + str(e), ERR)
             self.after(0, self.log, traceback.format_exc(), MUTED)
             self.after(0, lambda: self.status.configure(text="Ошибка", fg=ERR))
-            self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+            self.error_box("Ошибка", e)
         finally:
             self.after(0, self.prog.stop)
             self.after(0, self.prog.pack_forget)
             self.after(0, lambda: self.btn.configure(state="normal", bg=ACCENT))
 
+    def run_verify(self):
+        """Сверяет уже готовые перечни с чертежами, ничего не перевыпуская."""
+        docs = [p for p in (self.var_old_in.get().strip(),
+                            self.var_old_out.get().strip()) if p]
+        items = self._drawing_items()
+        if not docs:
+            messagebox.showwarning(
+                "Сверка", "Укажите перечни (.docx) в полях выше — их и будем сверять.")
+            return
+        if not items:
+            messagebox.showwarning(
+                "Сверка", "Добавьте чертежи на странице «Сборка перечней»: "
+                          "сверять перечни не с чем.")
+            return
+        self.dbtn.configure(state="disabled", bg=ACCENT_DIS)
+        self.dprog.pack(side="left", padx=(8, 0))
+        self.dprog.start(12)
+        threading.Thread(target=self._verify_work, args=(items, docs), daemon=True).start()
+
+    def _verify_work(self, items, docs):
+        try:
+            secs = None
+            key = json.dumps(items, ensure_ascii=False)
+            if self.sections is not None and self.sections_files == key:
+                secs = self.sections
+            if secs is None:
+                secs = core.read_sections(items, log=self._logcb())
+            res = core.verify_perechen(secs, docs, log=self._logcb())
+            self.verify_result = res
+            n_ok = res["counts"].get("совпало", 0)
+            n_all = res["counts"].get("в_чертеже", 0)
+            if res["ok"]:
+                self.after(0, self.log, f"СВЕРКА ПРОЙДЕНА: сошлось {n_ok} из {n_all}", OK)
+                self.after(0, lambda: self.diff_stat.configure(
+                    text=f"сверка пройдена: {n_ok} из {n_all}", fg=OK))
+            else:
+                n = len(res["issues"])
+                self.after(0, self.log, f"СВЕРКА: расхождений {n} — подробности в журнале", ERR)
+                self.after(0, lambda: self.diff_stat.configure(
+                    text=f"расхождений: {n}", fg=ERR))
+            self.after(0, self._fill_verify_grid, res)
+        except Exception as e:
+            self.after(0, self.log, "ОШИБКА: " + str(e), ERR)
+            self.error_box("Сверка", e)
+        finally:
+            self.after(0, self.dprog.stop)
+            self.after(0, self.dprog.pack_forget)
+            self.after(0, lambda: self.dbtn.configure(state="normal", bg=ACCENT))
+
+    def _fill_verify_grid(self, res):
+        """Показывает расхождения сверки в той же таблице, что и сравнение."""
+        for i in self.dg.get_children():
+            self.dg.delete(i)
+        for kind, kc, io_, a, b in res["issues"]:
+            tag = "удалено" if kind.startswith("нет в документе") else (
+                "добавлено" if kind.startswith("нет в чертеже") else "изменено")
+            self.dg.insert("", "end", values=(kind, io_, kc, a, b), tags=(tag,))
+
+    def export_verify(self):
+        """Сохраняет отчёт сверки в .xlsx."""
+        if not self.verify_result:
+            messagebox.showinfo("Сверка", "Сначала соберите перечни — сверка идёт автоматически.")
+            return
+        p = filedialog.asksaveasfilename(defaultextension=".xlsx",
+                                         filetypes=[("Excel", "*.xlsx")],
+                                         initialfile="Сверка перечней с чертежами.xlsx")
+        if not p:
+            return
+        try:
+            core.export_verify_xlsx(self.verify_result, p)
+            self.log(f"Отчёт сверки сохранён: {p}", OK)
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
+
     def go_package(self):
         items = self._drawing_items()
         t_in, t_out = self.var_in.get().strip(), self.var_out.get().strip()
         dst = self.var_dst.get().strip()
-        if not items or not (t_in or t_out) or not dst:
+        has_tpl = (t_in or t_out or core.default_template("in")
+                   or core.default_template("out"))
+        if not items or not has_tpl or not dst:
             messagebox.showwarning("Пакетная сборка",
-                                   "Нужны: чертежи, шаблон(ы) перечней и папка результата.")
+                                   "Нужны: чертежи и папка результата. "
+                                   "Шаблоны берутся встроенные, если не указаны свои.")
             return
         self._save_cfg()
         self.btn.configure(state="disabled", bg=ACCENT_DIS)
@@ -1527,13 +1930,8 @@ class App(BaseTk):
     def _package_work(self, items, t_in, t_out, dst):
         try:
             if self.var_rev.get():
-                import datetime
-                n = 1 + sum(1 for f in os.listdir(dst)
-                            if f.startswith("Ревизия") and
-                            os.path.isdir(os.path.join(dst, f)))
-                dst = os.path.join(dst, f"Ревизия {n:02d} — "
-                                   + datetime.date.today().strftime("%d.%m.%Y"))
-                os.makedirs(dst, exist_ok=True)
+                dst = core.next_revision_dir(dst)
+                os.makedirs(dst)
                 self.after(0, self.log, f"Пакет собирается в: {dst}")
             results = core.run(items, t_in or None, t_out or None, dst,
                                log=self._logcb(), update_fields=self.var_upd.get(), make_pdf=self.var_pdf.get())
@@ -1544,40 +1942,57 @@ class App(BaseTk):
             self.after(0, self.log, "Сводка сигналов.xlsx — готово", OK)
             eq = core.read_equipment(items, log=lambda s: None)
             self.equip = eq
-            core.export_spec_xlsx(eq, secs, os.path.join(dst, "Спецификация (заготовка).xlsx"))
-            self.after(0, self.log, "Спецификация (заготовка).xlsx — готово", OK)
-            core.export_pz_docx(secs, eq, os.path.join(dst, "ПЗ Автоматизация (заготовка).docx"))
-            self.after(0, self.log, "ПЗ Автоматизация (заготовка).docx — готово", OK)
-            if self.var_rev.get():
-                import datetime, hashlib
-                lines = [f"Пакет собран: {datetime.datetime.now():%d.%m.%Y %H:%M}",
-                         f"Приложение: Перечни из схем v{APP_VER}", "", "Чертежи:"]
-                for pth, sec_name in items:
-                    try:
-                        h = hashlib.md5(open(pth, "rb").read()).hexdigest()[:10]
-                        mt = datetime.datetime.fromtimestamp(
-                            os.path.getmtime(pth)).strftime("%d.%m.%Y %H:%M")
-                        lines.append(f"  {sec_name} <- {pth} (изм. {mt}, md5 {h})")
-                    except Exception:
-                        lines.append(f"  {sec_name} <- {pth}")
-                lines += ["", "Шаблоны:", f"  входные:  {t_in}", f"  выходные: {t_out}",
-                          "", "Разделы:"]
-                for cab, rows in secs:
-                    used = sum(1 for r in rows if r["desc"] != "Резерв")
-                    lines.append(f"  {cab}: {len(rows)} каналов (занято {used})")
-                warns = core.checks_report(secs)
-                lines += ["", f"Проверки: {len(warns)} замечаний"]
-                lines += ["  " + w for w in warns]
-                with open(os.path.join(dst, "манифест.txt"), "w", encoding="utf-8") as f:
-                    f.write("\n".join(lines))
-                self.after(0, self.log, "манифест.txt — готово", OK)
+            spec_docx = os.path.join(dst, "Спецификация оборудования и материалов.docx")
+            tpl_spec = core.default_template("spec")
+            if tpl_spec:
+                core.build_spec_docx(tpl_spec, spec_docx,
+                                     core.spec_sections_for_cabs([n for n, _i in eq]),
+                                     log=lambda t: self.after(0, self.log, t))
+                self.after(0, self.log,
+                           "Спецификация оборудования и материалов.docx — готово", OK)
+                self.after(0, self.log, core.SPEC_EXCLUDED_NOTE)
+            else:
+                self.after(0, self.log,
+                           "шаблон спецификации не найден — документ не собран", ERR)
+            vedom = os.path.join(dst, "Ведомость комплектации шкафов.xlsx")
+            core.export_spec_xlsx(eq, secs, vedom)
+            self.after(0, self.log, "Ведомость комплектации шкафов.xlsx — готово", OK)
+            pz_docx = os.path.join(dst, "Пояснительная записка.docx")
+            tpl_pz = core.default_template("pz")
+            if tpl_pz:
+                core.build_pz_docx(tpl_pz, pz_docx, secs, eq,
+                                   log=lambda t: self.after(0, self.log, t))
+            else:
+                core.export_pz_docx(secs, eq, pz_docx)
+                self.after(0, self.log,
+                           "шаблон записки не найден — документ без рамки и штампа", ERR)
+            self.after(0, self.log, "Пояснительная записка.docx — готово", OK)
+            # Паспорт выпуска: считает и оформляет его ядро, здесь только вызов.
+            if self.var_manifest.get():
+                try:
+                    outs = list(results) + [
+                        os.path.join(dst, "Сводка сигналов.xlsx"),
+                        spec_docx, vedom,
+                        pz_docx]
+                    mp = core.write_manifest(
+                        os.path.join(dst, "Паспорт выпуска.txt"),
+                        sources=[(sec_name, pth) for pth, sec_name in items],
+                        sections=secs,
+                        out_files=[o for o in outs if os.path.exists(o)],
+                        templates={"входные": t_in, "выходные": t_out},
+                        verify=getattr(self, "verify_result", None),
+                        checks=core.checks_report(secs),
+                        app_version=APP_VER)
+                    self.after(0, self.log, "Паспорт выпуска.txt — готово", OK)
+                except Exception as me:
+                    self.after(0, self.log, "паспорт выпуска не записан: " + str(me), ERR)
             self.after(0, self.log, "ПАКЕТ СОБРАН: " + dst, OK)
             self.after(0, lambda: self.status.configure(text="Пакет готов ✓", fg=OK))
             self.after(0, lambda: self.btn_open.pack(side="left", padx=(8, 0)))
         except Exception as e:
             self.after(0, self.log, "ОШИБКА: " + str(e), ERR)
             self.after(0, lambda: self.status.configure(text="Ошибка", fg=ERR))
-            self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+            self.error_box("Ошибка", e)
         finally:
             self.after(0, self.prog.stop)
             self.after(0, self.prog.pack_forget)
@@ -1620,7 +2035,7 @@ class App(BaseTk):
                 self.after(0, add_all)
         except Exception as e:
             self.after(0, self.log, "ОШИБКА: " + str(e), ERR)
-            self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+            self.error_box("Ошибка", e)
         finally:
             self.after(0, self.cprog.stop)
             self.after(0, self.cprog.pack_forget)
@@ -1661,7 +2076,7 @@ class App(BaseTk):
             self.after(0, show)
         except Exception as e:
             self.after(0, self.log, "ОШИБКА: " + str(e), ERR)
-            self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+            self.error_box("Ошибка", e)
         finally:
             self.after(0, self.dprog.stop)
             self.after(0, self.dprog.pack_forget)
@@ -1683,5 +2098,186 @@ class App(BaseTk):
             messagebox.showerror("Ошибка", str(e))
 
 
+REQUIRED = [
+    ("ezdxf",      "ezdxf",       "чтение чертежей DXF"),
+    ("docx",       "python-docx", "запись перечней в Word"),
+    ("openpyxl",   "openpyxl",    "выгрузка в Excel"),
+    ("matplotlib", "matplotlib",  "печать чертежей в PDF"),
+]
+
+
+def check_deps():
+    """Список отсутствующих библиотек: [(пакет, зачем нужен), ...]."""
+    import importlib
+    miss = []
+    for mod, pkg, why in REQUIRED:
+        try:
+            importlib.import_module(mod)
+        except Exception:
+            miss.append((pkg, why))
+    return miss
+
+
+def show_startup_error(title, text):
+    """Показывает ошибку окном; если окно не поднять — печатает в консоль."""
+    try:
+        r = tk.Tk()
+        r.withdraw()
+        messagebox.showerror(title, text)
+        r.destroy()
+    except Exception:
+        print(title + "\n\n" + text)
+
+
+def install_crash_handler(app):
+    """Необработанная ошибка не должна молча закрывать окно.
+
+    В собранном .exe консоли нет, traceback уходит в никуда, и пользователь
+    видит только исчезнувшую программу. Показываем понятное окно и пишем
+    подробности в файл рядом с программой.
+    """
+    def handler(exc, val, tb):
+        text = "".join(traceback.format_exception(exc, val, tb))
+        path = os.path.join(APP_DIR, "ошибка.log")
+        try:
+            import datetime
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n=== %s ===\n%s"
+                        % (datetime.datetime.now().isoformat(" ", "seconds"), text))
+        except Exception:
+            path = "(не удалось записать файл лога)"
+        messagebox.showerror(
+            "Что-то пошло не так",
+            "Программа столкнулась с ошибкой, но продолжает работать.\n\n"
+            f"{val.__class__.__name__}: {val}\n\n"
+            f"Подробности записаны в файл:\n{path}\n\n"
+            "Если ошибка повторяется — пришлите этот файл разработчику.")
+    app.report_callback_exception = handler
+
+
+def run_selftest(dxf=None):
+    """Проверка собранной программы без окна: --selftest [чертёж.dxf]
+
+    Нужна потому, что запуск окна ещё не доказывает работоспособность: при
+    сборке в .exe чаще всего отваливаются данные matplotlib и ezdxf, а видно
+    это только когда доходит до дела. Отчёт пишется рядом с программой.
+    """
+    import tempfile, shutil, traceback, datetime
+    lines = []
+    def say(t=""):
+        lines.append(str(t))
+    say("Проверка программы — %s" % datetime.datetime.now().strftime("%d.%m.%Y %H:%M"))
+    say("Файл: %s" % os.path.abspath(sys.argv[0]))
+    say("=" * 60)
+    bad = 0
+
+    def step(name, fn):
+        nonlocal bad
+        try:
+            r = fn()
+            say("  ок    %s%s" % (name, ("  — " + str(r)) if r else ""))
+        except Exception as e:
+            bad += 1
+            say("  ПЛОХО %s: %s: %s" % (name, type(e).__name__, e))
+            say("        " + traceback.format_exc().strip().splitlines()[-1])
+
+    step("библиотеки на месте", lambda: "нет: " + ", ".join(p for p, _ in check_deps())
+         if check_deps() else "все")
+    step("встроенные шаблоны", lambda: os.path.basename(core.default_template("in")) or "НЕ НАЙДЕН")
+    step("словарь сокращений", lambda: "%d пар" % len(core.load_abbrev()))
+    step("шрифт для замены SHX", lambda: core.pick_subst_font() or "не найден")
+    step("конвертер DWG", lambda: " ".join(core.find_converter()) or "не найден")
+
+    def matplotlib_ok():
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig = plt.figure(figsize=(1, 1)); plt.close(fig)
+        return matplotlib.get_data_path()
+    step("matplotlib рисует", matplotlib_ok)
+
+    def ezdxf_ok():
+        import ezdxf
+        d = ezdxf.new(); d.modelspace().add_text("проверка")
+        return "версия " + ezdxf.__version__
+    step("ezdxf читает и пишет", ezdxf_ok)
+
+    if dxf and os.path.exists(dxf):
+        tmp = tempfile.mkdtemp(prefix="selftest_")
+        try:
+            rows = []
+            step("разбор чертежа", lambda: "каналов: %d" % len(
+                rows.extend(core.extract(dxf, log=lambda *a: None)) or rows))
+            if rows:
+                secs = [("ШКАФ ПРОВЕРКА", rows)]
+                built = []
+                step("сборка перечней", lambda: "документов: %d" % len(
+                    built.extend(core.run([], "", "", tmp, sections=secs,
+                                          log=lambda *a: None)) or built))
+                if built:
+                    step("сверка с чертежом", lambda: (
+                        "сошлось %d" % core.verify_perechen(secs, built, log=lambda *a: None)
+                        ["counts"]["совпало"]))
+            step("печать PDF", lambda: "листов: %d" % len(
+                core.export_sheets_pdf(dxf, os.path.join(tmp, "t.pdf"),
+                                       log=lambda *a: None)[1]))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    else:
+        say("  (чертёж не передан — разбор, сборка и печать PDF не проверялись)")
+        say("  запуск с чертежом:  Perechni-signalov.exe --selftest C:\\путь\\чертёж.dxf")
+
+    say("=" * 60)
+    say("ИТОГ: " + ("всё работает" if not bad else "замечаний: %d" % bad))
+    text = "\n".join(lines)
+    out = os.path.join(APP_DIR, "проверка сборки.txt")
+    try:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except Exception:
+        out = "(не удалось записать файл)"
+    print(text)
+    # В собранном .exe консоли нет, поэтому отчёт надо показать. Но окно с
+    # кнопкой «ОК» блокирует выполнение до нажатия — а проверку сборки часто
+    # запускают из скрипта, где нажимать некому. Поэтому просто открываем
+    # файл отчёта в блокноте: видно так же, а выполнение не встаёт.
+    if getattr(sys, "frozen", False) and os.path.exists(out):
+        try:
+            os.startfile(out)          # не блокирует
+        except Exception:
+            pass
+    return 1 if bad else 0
+
+
+def main():
+    if "--selftest" in sys.argv:
+        i = sys.argv.index("--selftest")
+        arg = sys.argv[i + 1] if len(sys.argv) > i + 1 else None
+        return run_selftest(arg)
+    miss = check_deps()
+    if miss:
+        lines = "\n".join(f"  - {pkg} — {why}" for pkg, why in miss)
+        pkgs = " ".join(pkg for pkg, _why in miss)
+        show_startup_error(
+            "Не хватает библиотек",
+            "Программа не может запуститься: не установлены нужные компоненты.\n\n"
+            f"{lines}\n\n"
+            "Как исправить — выполнить в командной строке:\n\n"
+            f"    pip install {pkgs}\n\n"
+            "Если вы пользуетесь готовым .exe — сообщите разработчику, "
+            "сборка неполная.")
+        return 1
+    try:
+        app = App()
+    except Exception as e:
+        show_startup_error(
+            "Не удалось запустить программу",
+            f"{e.__class__.__name__}: {e}\n\n" + traceback.format_exc()[-1200:])
+        return 1
+    install_crash_handler(app)
+    app.mainloop()
+    return 0
+
+
 if __name__ == "__main__":
-    App().mainloop()
+    sys.exit(main())
